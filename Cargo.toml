@@ -15,9 +15,14 @@ path = "src/lib.rs"
 
 [dependencies]
 oxigraph = "0.4"
+tantivy = "0.22"
+cactus-rs = { version = "0.3", default-features = false, features = ["download-binaries", "download"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["json"] }
+tower = { version = "0.4", features = ["limit", "util"] }
+tower-http = { version = "0.5", features = ["limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "1"
@@ -32,3 +37,4 @@ opt-level = 0
 
 [features]
 test-hooks = []
+live-model = ["cactus-rs"]
