@@ -7,15 +7,25 @@
 
 pub mod create;
 pub mod delete;
+pub mod instances;
+pub mod query_tools;
 pub mod read;
 pub mod search;
 pub mod update;
+pub mod validate_tool;
+pub mod verify;
+pub mod vocabulary;
 
 pub use create::CreateArgs;
 pub use delete::DeleteArgs;
+pub use instances::{DescribeResourceArgs, SearchInstancesArgs};
+pub use query_tools::{BuildQueryArgs, ExecuteQueryArgs, InspectQueryArgs};
 pub use read::ReadArgs;
 pub use search::SearchArgs;
 pub use update::UpdateArgs;
+pub use validate_tool::ValidateArgs;
+pub use verify::VerifyArgs;
+pub use vocabulary::{DescribeVocabularyArgs, SearchVocabularyArgs};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -83,6 +93,7 @@ pub struct ToolState {
     pub shapes: Vec<Shape>,
     pub audit: Arc<AuditLog>,
     pub limits: AppLimits,
+    pub query_plans: Arc<crate::query::QueryPlanStore>,
 }
 
 impl ToolState {
@@ -101,6 +112,7 @@ impl ToolState {
             shapes,
             audit,
             limits,
+            query_plans: Arc::new(crate::query::QueryPlanStore::new()),
         }
     }
 }
@@ -223,6 +235,126 @@ pub fn tool_defs() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "search_vocabulary",
+            description: "Use when you need OWL classes or properties from the ontology. Args: query or terms (strings), namespaces (optional), limit. Returns: VocabularyCandidates with iri, kind, label, domain, range.",
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "terms": { "type": "array", "items": { "type": "string" } },
+                    "namespaces": { "type": "array", "items": { "type": "string" } },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+                },
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "describe_vocabulary",
+            description: "Use when you have class or property IRIs and need definitions. Args: iris (array of strings). Returns: ResolvedVocabulary with kind, domain, range, superclasses.",
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "iris": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["iris"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "search_instances",
+            description: "Use when you need real resources by words. Args: text (string), types (optional), namespace (optional), context (optional graph), limit. Returns: ResourceCandidates with uri, label, type, description.",
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" },
+                    "types": { "type": "array", "items": { "type": "string" } },
+                    "namespace": { "type": "string" },
+                    "context": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+                },
+                "required": ["text"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "describe_resource",
+            description: "Use when you have instance URIs and need their types and properties. Args: uris (array), context (optional graph). Returns: ResourceDescriptions with types and properties.",
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "uris": { "type": "array", "items": { "type": "string" } },
+                    "context": { "type": "string" }
+                },
+                "required": ["uris"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "validate",
+            description: "Use when you must check SHACL constraints before or after a mutation. Args: graph (string), uri (optional). Returns: ValidationResult with conforms and violations.",
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "graph": { "type": "string" },
+                    "uri": { "type": "string" }
+                },
+                "required": ["graph"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "build_query",
+            description: "Use when you need to select resources by typed graph patterns. Args: pattern (typed object with graphs, patterns, filters, return_vars, limit), context (optional graph). Returns: plan_id with compiled form, explanation, representations.",
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "object" },
+                    "context": { "type": "string" }
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "inspect_query",
+            description: "Use when you have a plan_id and need its compiled form and match estimate. Args: plan_id (string). Returns: compiled form, explanation, representations, match_estimate.",
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "plan_id": { "type": "string" }
+                },
+                "required": ["plan_id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "execute_query",
+            description: "Use when a built plan is validated and you need its matching URIs. Args: plan_id (string), limit (optional int). Returns: uris, rows, count, truncated.",
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "plan_id": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+                },
+                "required": ["plan_id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "verify",
+            description: "Use when you must independently confirm an outcome by re-querying. Args: question (string), graph (string), uri (optional). Returns: VerificationResult with quad_count and answer.",
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string" },
+                    "graph": { "type": "string" },
+                    "uri": { "type": "string" }
+                },
+                "required": ["question", "graph"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
             name: "delete",
             description: "Use when you must remove a resource or selected triples. Args: uri (optional string), triples (optional array), graph (string), confirmation_token (optional string, required for destructive ops). Returns: committed delta with removed triples or a dry-run summary.",
             schema: serde_json::json!({
@@ -279,10 +411,27 @@ impl ToolRegistry {
     }
 
     /// Dispatch one tool call with an execution context.
+    /// Legacy path: new Plan-2 tools run under `GraphContext::default()`
+    /// (unconstrained), preserving Plan-1 E2E behavior.
     pub fn dispatch(
         &self,
         state: &ToolState,
         ctx: &ExecutionContext,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, ToolError> {
+        self.dispatch_with_context(state, ctx, &crate::plan::GraphContext::default(), name, args)
+    }
+
+    /// Dispatch with an explicit plan `GraphContext`. All handlers take the
+    /// context; namespace isolation + graph allowlist are enforced here for
+    /// the Plan-2 tools (legacy tools enforce their own `context` graph arg
+    /// plus `check_read_auth`).
+    pub fn dispatch_with_context(
+        &self,
+        state: &ToolState,
+        ctx: &ExecutionContext,
+        graph_ctx: &crate::plan::GraphContext,
         name: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, ToolError> {
@@ -306,6 +455,42 @@ impl ToolRegistry {
             "delete" => {
                 let a: DeleteArgs = parse_args(name, args)?;
                 delete::handle(state, ctx, a)
+            }
+            "search_vocabulary" => {
+                let a: SearchVocabularyArgs = parse_args(name, args)?;
+                vocabulary::handle_search_vocabulary(state, ctx, graph_ctx, a)
+            }
+            "describe_vocabulary" => {
+                let a: DescribeVocabularyArgs = parse_args(name, args)?;
+                vocabulary::handle_describe_vocabulary(state, ctx, graph_ctx, a)
+            }
+            "search_instances" => {
+                let a: SearchInstancesArgs = parse_args(name, args)?;
+                instances::handle_search_instances(state, ctx, graph_ctx, a)
+            }
+            "describe_resource" => {
+                let a: DescribeResourceArgs = parse_args(name, args)?;
+                instances::handle_describe_resource(state, ctx, graph_ctx, a)
+            }
+            "validate" => {
+                let a: ValidateArgs = parse_args(name, args)?;
+                validate_tool::handle_validate(state, ctx, graph_ctx, a)
+            }
+            "build_query" => {
+                let a: BuildQueryArgs = parse_args(name, args)?;
+                query_tools::handle_build_query(state, ctx, graph_ctx, a)
+            }
+            "inspect_query" => {
+                let a: InspectQueryArgs = parse_args(name, args)?;
+                query_tools::handle_inspect_query(state, ctx, graph_ctx, a)
+            }
+            "execute_query" => {
+                let a: ExecuteQueryArgs = parse_args(name, args)?;
+                query_tools::handle_execute_query(state, ctx, graph_ctx, a)
+            }
+            "verify" => {
+                let a: VerifyArgs = parse_args(name, args)?;
+                verify::handle_verify(state, ctx, graph_ctx, a)
             }
             other => Err(ToolError::unknown(other)),
         }
@@ -367,9 +552,10 @@ pub fn check_read_auth(
 }
 
 /// Grounding gate: reject invented/unsupported values before sensitive ops.
-/// Search/read are always allowed. Create/update/delete require well-formed
-/// IRIs; update/delete targets must already exist (otherwise the model
-/// invented a URI).
+/// Read-only tools (search/read/vocabulary/instance/validate/verify) are
+/// always allowed. Create/update/delete require well-formed IRIs;
+/// update/delete targets must already exist (otherwise the model invented
+/// a URI).
 pub fn check_grounding(
     tool: &str,
     state: &ToolState,
@@ -379,7 +565,9 @@ pub fn check_grounding(
 ) -> Result<(), ToolError> {
     let _ = ctx;
     match tool {
-        "search" | "read" => Ok(()),
+        "search" | "read" | "search_vocabulary" | "describe_vocabulary" | "search_instances"
+        | "describe_resource" | "validate" | "verify" | "build_query" | "inspect_query"
+        | "execute_query" => Ok(()),
         _ => {
             if let Some(uri) = target_uri {
                 if !valid_iri(uri) {
@@ -413,12 +601,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_lists_five_tools() {
+    fn registry_lists_legacy_five_plus_plan2_six() {
         let r = ToolRegistry::new();
         assert_eq!(
             r.names(),
-            vec!["create", "delete", "read", "search", "update"]
+            vec![
+                "build_query",
+                "create",
+                "delete",
+                "describe_resource",
+                "describe_vocabulary",
+                "execute_query",
+                "inspect_query",
+                "read",
+                "search",
+                "search_instances",
+                "search_vocabulary",
+                "update",
+                "validate",
+                "verify"
+            ]
         );
+        // Legacy five still present (Plan-1 E2E compat).
+        for legacy in ["create", "delete", "read", "search", "update"] {
+            assert!(r.get(legacy).is_some(), "{legacy} missing");
+        }
         assert!(r.get("nope").is_none());
     }
 

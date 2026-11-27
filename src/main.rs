@@ -14,6 +14,7 @@ use needle_rdf_agent::{
     agent::{conversation::ConversationLog, worker::spawn_worker, Agent},
     api::{router, ApiState},
     config::AppConfig,
+    llm::{build_backend, load_llm_config},
     model::MockModel,
     observability,
     ontology::{contact_shapes, load_default_ontology, OntologyReasoner},
@@ -35,7 +36,33 @@ fn require_live() -> bool {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     observability::init_tracing();
-    let config = AppConfig::default();
+    // Plan 2 Phase 1: dotenvy + keyless agentstream config. The binary must
+    // start with only OPENAI_BASE_URL set, so a MissingKey (remote without
+    // key) falls back to defaults with a warning instead of crashing.
+    let config = match AppConfig::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("LLM config error ({e}); continuing with keyless-local defaults");
+            let mut fallback = AppConfig::default();
+            // Keep any successfully resolved piece: re-attempt local-only load.
+            if let Ok(local) = load_llm_config() {
+                fallback.llm = local;
+            }
+            fallback
+        }
+    };
+    info!("LLM runtime: {}", config.llm.summary());
+    // Non-Needle backend for Phase-4 planners. Construction performs no I/O,
+    // so a down local server does not prevent startup; planner calls will
+    // surface `LlmUnavailable`-style transport errors at request time.
+    let llm_backend: std::sync::Arc<dyn agentstream::backends::LLMBackend> =
+        build_backend(&config.llm);
+    info!(
+        "agentstream backend ready (model={}, base_url={})",
+        config.llm.model,
+        config.llm.base_url
+    );
+    let _ = &llm_backend;
     let repo = Arc::new(OxigraphRepository::new_in_memory(
         config.limits.max_triples_per_read,
     )?);

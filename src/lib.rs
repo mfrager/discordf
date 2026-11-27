@@ -7,10 +7,15 @@
 pub mod agent;
 pub mod api;
 pub mod config;
+pub mod executor;
+pub mod llm;
 pub mod model;
 pub mod observability;
 pub mod ontology;
+pub mod plan;
+pub mod planner;
 pub mod policy;
+pub mod query;
 pub mod rdf;
 pub mod search;
 pub mod tools;

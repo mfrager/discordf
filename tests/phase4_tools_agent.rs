@@ -600,10 +600,30 @@ fn failing_tool_then_retry_succeeds() {
 #[test]
 fn registry_contract_names_and_unknown() {
     let (reg, _s, _c, _g) = fixture();
+    // Plan-1 legacy five plus Plan-2 six plus Phase-3 three (typed query plans).
     assert_eq!(
         reg.names(),
-        vec!["create", "delete", "read", "search", "update"]
+        vec![
+            "build_query",
+            "create",
+            "delete",
+            "describe_resource",
+            "describe_vocabulary",
+            "execute_query",
+            "inspect_query",
+            "read",
+            "search",
+            "search_instances",
+            "search_vocabulary",
+            "update",
+            "validate",
+            "verify"
+        ]
     );
+    // Legacy five still present.
+    for legacy in ["create", "delete", "read", "search", "update"] {
+        assert!(reg.get(legacy).is_some());
+    }
 }
 
 #[test]

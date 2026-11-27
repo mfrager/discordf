@@ -73,12 +73,17 @@ impl AppLimits {
     }
 }
 
-/// Top-level application configuration (Phase 1 subset).
+/// Top-level application configuration (Phase 1 subset + Plan 2 Phase 1 LLM).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Named-graph used when callers do not specify one.
     pub default_graph: String,
     pub limits: AppLimits,
+    /// Non-Needle LLM runtime (agentstream backend). Loaded via
+    /// `crate::llm::load_llm_config()` after `dotenvy::dotenv()`; defaults
+    /// to keyless-local so the binary starts with only `OPENAI_BASE_URL` set.
+    #[serde(default)]
+    pub llm: crate::llm::LlmConfig,
 }
 
 impl Default for AppConfig {
@@ -86,7 +91,20 @@ impl Default for AppConfig {
         Self {
             default_graph: "urn:needle:default".to_string(),
             limits: AppLimits::default(),
+            llm: crate::llm::LlmConfig::default(),
         }
+    }
+}
+
+impl AppConfig {
+    /// Load limits from `NEEDLE_*` env plus LLM config via `dotenvy`.
+    /// Missing local key is not an error; remote base URL without a key is.
+    pub fn from_env() -> Result<Self, crate::llm::LlmError> {
+        Ok(Self {
+            default_graph: "urn:needle:default".to_string(),
+            limits: AppLimits::from_env(),
+            llm: crate::llm::load_llm_config()?,
+        })
     }
 }
 
