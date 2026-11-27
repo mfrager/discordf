@@ -116,3 +116,36 @@ No code change needed; `KeyMode::KeyPresent` is used automatically.
   UPDATE_3 §9: B (tool loop) with C as fallback — all planners share this
   executor path, so the default rests on planner-loop reliability, overturn
   only with eval numbers.
+
+## Phase 5 real-backend results (2026-11-27)
+
+- Endpoint: `http://localhost:8080` (`MiniCPM5-1B-F16`, keyless,
+  `AbsentLocal`). Server verified to support chat + `tool_calls` +
+  `response_format: json_schema`; the model always emits a long
+  `reasoning_content` trace, so single-shot planners need large `max_tokens`
+  (1024/turn for B, 2048 for C/D) and still starve on a 1B budget.
+- `tests/real_backends.rs`: B/C/D run live (`RUN_MODEL_TESTS=1 ... --
+  --ignored`) through the real `agentstream` HTTP backend, keyless. A
+  recording proxy (`RECORD=1`) saves raw response bodies to
+  `tests/recordings/{b,c,d}.json`; default `cargo test` replays them through
+  a stub (deterministic CI, no server). Regenerate recordings when the
+  model/endpoint changes; replay tests pin the recorded outcome class.
+- `tests/live_planner_a.rs` (`--features live-model`): Needle 3 with real
+  cached weights, engine built on the **planning surface**
+  (`planner_system_prompt` + `planning_tool_defs`) — the production wiring
+  for A. The five RDF `tool_defs` belong to the executor path only.
+- Observed (honest model-quality findings, all transport keyless and clean,
+  model id asserted on every request):
+  - B: real `add_step` tool calls parsed/applied; model repeats the same
+    invalid call (empty `args`) despite validation feedback → typed `Budget`
+    stop after 3 stagnant turns. Loop mechanics proven; 1B model cannot
+    self-correct.
+  - C: 3/3 calls burn the whole budget on reasoning, empty `content` →
+    typed `Schema` after repairs.
+  - D: pass-1 empty (reasoning fills budget) → typed `Model` error at once.
+  - A: real Needle engine, 10-turn cap, typed `Budget` stop in ~18 s.
+- Live tests assert no-transport-failure + model-id propagation, and join
+  planner→executor→final-state automatically whenever a model returns a
+  valid plan (none did on this 1B build). Replay tests pin the three typed
+  outcomes deterministically. Overturn by re-running live against a larger
+  local model — no code changes needed (model id stays `OPENAI_MODEL`).
