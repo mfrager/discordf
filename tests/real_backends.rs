@@ -55,7 +55,7 @@ fn server_model() -> String {
 
 fn keyless_backend(base_url: &str, model: &str, max_tokens: u32) -> AgentBackend {
     std::env::remove_var("OPENAI_API_KEY");
-    let cfg = config_from_vars(Some(base_url), Some(model), None, Some("300"))
+    let cfg = config_from_vars(Some(base_url), Some(model), None, Some("1800"))
         .expect("keyless local config");
     assert_eq!(cfg.key_mode, KeyMode::AbsentLocal, "live tests are keyless");
     let backend = build_backend(&cfg);
@@ -329,8 +329,9 @@ async fn live_b_tool_loop_against_real_server() {
     let proxy = maybe_proxy("b").await;
     let base = proxy.as_ref().map(|(u, _)| u.clone()).unwrap_or_else(server_base);
     let model = server_model();
-    // Reasoning model: needs room for reasoning + tool calls per turn.
-    let backend = keyless_backend(&base, &model, 1024);
+    // Capped at 4092: the 1B model's reasoning fills whatever context it
+    // gets, so bigger budgets only buy longer waits, not better plans.
+    let backend = keyless_backend(&base, &model, 4092);
     // Default caps: the 1B model needs room to stumble into valid calls;
     // the loop mechanics (validation feedback, no-progress guard) are what
     // turn that stumbling into either a plan or a typed Budget stop.
@@ -354,8 +355,8 @@ async fn live_c_structured_against_real_server() {
     let proxy = maybe_proxy("c").await;
     let base = proxy.as_ref().map(|(u, _)| u.clone()).unwrap_or_else(server_base);
     let model = server_model();
-    // Single-shot full-plan JSON after a long reasoning trace: big budget.
-    let backend = keyless_backend(&base, &model, 2048);
+    // Capped at 4092 (see B): ample for short plans, bounded waits.
+    let backend = keyless_backend(&base, &model, 4092);
     let planner = AgentStructuredPlanner::new(backend);
     let request = ohio_request();
     let gctx = GraphContext {
@@ -376,7 +377,8 @@ async fn live_d_two_pass_against_real_server() {
     let proxy = maybe_proxy("d").await;
     let base = proxy.as_ref().map(|(u, _)| u.clone()).unwrap_or_else(server_base);
     let model = server_model();
-    let backend = keyless_backend(&base, &model, 2048);
+    // Capped at 4092 (see B): ample for short plans, bounded waits.
+    let backend = keyless_backend(&base, &model, 4092);
     let planner = AgentTwoPassPlanner::new(backend);
     let request = ohio_request();
     let gctx = GraphContext {

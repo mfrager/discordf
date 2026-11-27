@@ -98,10 +98,17 @@ mod live {
             Self::build(weights, &system, crate::tools::tool_defs())
         }
 
+        /// Token budget per engine turn (Phase 1, item 4). The default
+        /// (256) truncates tool calls on the planning surface before the
+        /// planning loop is ever exercised; 2048 fits multi-call turns
+        /// with headroom while staying bounded.
+        pub const COMPLETE_MAX_NEW_TOKENS: u32 = 2048;
+
         pub fn complete_turn(&self, user_text: &str) -> Result<ModelCompletion, ModelError> {
+            let options = CompleteOptions::new().with_max_new_tokens(Self::COMPLETE_MAX_NEW_TOKENS);
             let completion = self
                 .lock()?
-                .complete(user_text)
+                .complete_with_options(user_text, options)
                 .map_err(|e| ModelError::Engine(e.to_string()))?;
             Ok(convert(&completion))
         }

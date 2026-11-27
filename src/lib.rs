@@ -6,8 +6,10 @@
 
 pub mod agent;
 pub mod api;
+pub mod bench;
 pub mod config;
 pub mod executor;
+pub mod ladder_spec;
 pub mod llm;
 pub mod model;
 pub mod observability;

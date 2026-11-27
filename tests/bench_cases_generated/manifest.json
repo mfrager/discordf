@@ -1,0 +1,21 @@
+{
+  "generator": "bench-generator",
+  "version": 1,
+  "seed": 13910597721040879617,
+  "count": 500,
+  "per_category": {
+    "bulk_mutation": 42,
+    "mixed_discovery": 42,
+    "scope": 42,
+    "recovery": 41,
+    "crud": 42,
+    "security": 41,
+    "complex_query": 42,
+    "owl_shacl": 41,
+    "termination": 41,
+    "vocabulary": 42,
+    "intent": 42,
+    "instance_discovery": 42
+  },
+  "content_hash": "bfe49421cfed45ce"
+}

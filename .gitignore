@@ -1,3 +1,6 @@
 .env
 target/
 tests/recordings/
+tests/bench_cases/*
+tests/bench_cases_generated/*
+!tests/bench_cases_generated/manifest.json

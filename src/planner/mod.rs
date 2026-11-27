@@ -37,6 +37,15 @@
 //! `describe_resource`, `inspect_query`). Any `create` / `update` / `delete`
 //! / `execute_query` / `build_query` (or legacy `search` / `read`) tool call
 //! from a model is rejected with a typed error and never dispatched.
+//!
+//! Phase 2 adds [`spine::SpinePlanner`]: Rust owns the plan shape
+//! (spine templates), the model fills only scalar slots.
+//! Phase 3 adds [`compiler::CompilerPlanner`]: deterministic NL → Plan
+//! (entity linking + fixed templates, zero model calls), the model
+//! answers only bounded per-field slot questions.
+
+pub mod compiler;
+pub mod spine;
 
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
@@ -191,6 +200,169 @@ const OUTPUT_VALUES: &[&str] = &[
     "VerificationResult",
 ];
 
+/// Per-operation add tools (Phase 1, item 2): one tool per operation,
+/// each carrying only its operation's exact args schema. The generic
+/// [`TOOL_ADD_STEP`] stays as a counted fallback.
+pub const TOOL_ADD_SEARCH_VOCABULARY: &str = "add_search_vocabulary_step";
+pub const TOOL_ADD_DESCRIBE_VOCABULARY: &str = "add_describe_vocabulary_step";
+pub const TOOL_ADD_SEARCH_INSTANCES: &str = "add_search_instances_step";
+pub const TOOL_ADD_DESCRIBE_RESOURCE: &str = "add_describe_resource_step";
+pub const TOOL_ADD_QUERY: &str = "add_query_step";
+pub const TOOL_ADD_CREATE: &str = "add_create_step";
+pub const TOOL_ADD_UPDATE: &str = "add_update_step";
+pub const TOOL_ADD_DELETE: &str = "add_delete_step";
+pub const TOOL_ADD_VALIDATE: &str = "add_validate_step";
+pub const TOOL_ADD_VERIFY: &str = "add_verify_step";
+
+const PER_OP_ADD_TOOLS: &[(&str, Operation)] = &[
+    (TOOL_ADD_SEARCH_VOCABULARY, Operation::SearchVocabulary),
+    (TOOL_ADD_DESCRIBE_VOCABULARY, Operation::DescribeVocabulary),
+    (TOOL_ADD_SEARCH_INSTANCES, Operation::SearchInstances),
+    (TOOL_ADD_DESCRIBE_RESOURCE, Operation::DescribeResource),
+    (TOOL_ADD_QUERY, Operation::Query),
+    (TOOL_ADD_CREATE, Operation::Create),
+    (TOOL_ADD_UPDATE, Operation::Update),
+    (TOOL_ADD_DELETE, Operation::Delete),
+    (TOOL_ADD_VALIDATE, Operation::Validate),
+    (TOOL_ADD_VERIFY, Operation::Verify),
+];
+
+/// The per-operation add tool for `op`, or `None` for the generic path.
+pub fn per_op_add_tool(op: Operation) -> &'static str {
+    PER_OP_ADD_TOOLS
+        .iter()
+        .find(|(_, o)| *o == op)
+        .map(|(name, _)| *name)
+        .expect("per-op tool for every operation")
+}
+
+/// The operation implied by a per-operation add tool name.
+/// Returns `None` for the generic `add_step` and all other tools.
+pub fn op_for_add_tool(name: &str) -> Option<Operation> {
+    PER_OP_ADD_TOOLS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, o)| *o)
+}
+
+/// `StepArguments` discriminator tag for `op` (matches the serde
+/// `kind` tags; the single source of truth for kind defaults).
+pub fn kind_str_for(op: Operation) -> &'static str {
+    match op {
+        Operation::SearchVocabulary => "search_vocab",
+        Operation::DescribeVocabulary => "describe_vocab",
+        Operation::SearchInstances => "search_instances",
+        Operation::DescribeResource => "describe_resource",
+        Operation::Query => "query",
+        Operation::Create => "create",
+        Operation::Update => "update",
+        Operation::Delete => "delete",
+        Operation::Validate => "validate",
+        Operation::Verify => "verify",
+    }
+}
+
+/// Shared `TypedValue` union schema (step_ref / uri_set_ref / unresolved
+/// / iri). Static and permissive: ref narrowing per session state is a
+/// phase-1 stretch goal, not built here.
+fn typed_value_schema() -> serde_json::Value {
+    serde_json::json!({"anyOf": [
+        {"type": "object", "required": ["kind", "iri"],
+         "properties": {"kind": {"const": "iri"}, "iri": {"type": "string"}},
+         "additionalProperties": false},
+        {"type": "object", "required": ["kind", "description"],
+         "properties": {"kind": {"const": "unresolved"}, "description": {"type": "string"}},
+         "additionalProperties": false},
+        {"type": "object", "required": ["kind", "step", "field"],
+         "properties": {"kind": {"const": "step_ref"}, "step": {"type": "string"}, "field": {"type": "string"}},
+         "additionalProperties": false},
+        {"type": "object", "required": ["kind", "step"],
+         "properties": {"kind": {"const": "uri_set_ref"}, "step": {"type": "string"}},
+         "additionalProperties": false}
+    ]})
+}
+
+fn typed_value_array_schema() -> serde_json::Value {
+    serde_json::json!({"type": "array", "items": typed_value_schema()})
+}
+
+/// Exact args schema for `op`, mirroring the `StepArguments` serde
+/// shapes field-for-field (all serde fields present so
+/// `additionalProperties: false` never rejects a legal shape).
+/// When `require_kind` is set, `kind` is required with a `const`
+/// tag (structured C/D path, where `kind` discriminates the anyOf);
+/// otherwise `kind` is documented-but-optional and Rust fills it from
+/// the tool name (per-op tool path).
+pub fn args_schema_for(op: Operation, require_kind: bool) -> serde_json::Value {
+    let tv = typed_value_array_schema();
+    let kind_prop = serde_json::json!({"const": kind_str_for(op)});
+    let (mut props, mut required): (
+        serde_json::Map<String, serde_json::Value>,
+        Vec<serde_json::Value>,
+    ) = match op {
+        Operation::SearchVocabulary => (serde_json::json!({
+            "terms": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "namespaces": {"type": "array", "items": {"type": "string"}}
+        }).as_object().unwrap().clone(), vec!["terms".into()]),
+        Operation::DescribeVocabulary => (serde_json::json!({
+            "iris": tv
+        }).as_object().unwrap().clone(), vec!["iris".into()]),
+        Operation::SearchInstances => (serde_json::json!({
+            "text": {"type": "string", "minLength": 1},
+            "types": tv,
+            "namespace": {"type": ["string", "null"]}
+        }).as_object().unwrap().clone(), vec!["text".into()]),
+        Operation::DescribeResource => (serde_json::json!({
+            "uris": tv
+        }).as_object().unwrap().clone(), vec!["uris".into()]),
+        Operation::Query => (serde_json::json!({
+            "pattern": {}
+        }).as_object().unwrap().clone(), vec!["pattern".into()]),
+        Operation::Create => (serde_json::json!({
+            "types": tv,
+            "properties": {"type": "array"}
+        }).as_object().unwrap().clone(), vec!["types".into()]),
+        Operation::Update => (serde_json::json!({
+            "targets": tv,
+            "predicate": typed_value_schema(),
+            "objects": tv
+        }).as_object().unwrap().clone(), vec!["targets".into(), "predicate".into(), "objects".into()]),
+        Operation::Delete => (serde_json::json!({
+            "targets": tv
+        }).as_object().unwrap().clone(), vec!["targets".into()]),
+        Operation::Validate => (serde_json::Map::new(), vec![]),
+        Operation::Verify => (serde_json::json!({
+            "question": {"type": "string", "minLength": 1}
+        }).as_object().unwrap().clone(), vec!["question".into()]),
+    };
+    if require_kind {
+        required.push("kind".into());
+    }
+    props.insert("kind".to_string(), kind_prop);
+    let mut schema = serde_json::Map::new();
+    schema.insert("type".to_string(), "object".into());
+    schema.insert("required".to_string(), required.into());
+    schema.insert("properties".to_string(), serde_json::Value::Object(props));
+    schema.insert("additionalProperties".to_string(), false.into());
+    serde_json::Value::Object(schema)
+}
+
+/// Exact per-operation add-tool envelope: no `operation` (implied by
+/// the tool name), no `output` (Rust fills `expected_for(op)`).
+fn per_op_tool_schema(op: Operation) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["id", "intent", "args"],
+        "properties": {
+            "id": {"type": "string"},
+            "intent": {"type": "string"},
+            "args": args_schema_for(op, false),
+            "depends_on": {"type": "array", "items": {"type": "string"}}
+        },
+        "additionalProperties": false
+    })
+}
+
 fn operation_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -207,9 +379,35 @@ fn operation_schema() -> serde_json::Value {
     })
 }
 
+/// Per-operation add-tool definitions: exact args schema per operation,
+/// no `operation` field (implied by the tool), no `output` field (Rust
+/// fills `expected_for(op)`). Descriptions stay under the tool
+/// description budget; the schema carries the shape, not the prose.
+pub fn per_op_planning_tool_defs() -> Vec<ToolDef> {
+    PER_OP_ADD_TOOLS
+        .iter()
+        .map(|(name, op)| ToolDef {
+            name,
+            description: match op {
+                Operation::SearchVocabulary => "Add a search_vocabulary step (find ontology terms). Args: id, intent, args {terms (non-empty), namespaces?}, depends_on (always []). Output set automatically.",
+                Operation::DescribeVocabulary => "Add a describe_vocabulary step (resolve term details). Args: id, intent, args {iris (step_refs to VocabularyCandidates)}, depends_on (the search step). Output set automatically.",
+                Operation::SearchInstances => "Add a search_instances step (find resources). Args: id, intent, args {text, types?, namespace?}, depends_on (a describe step, if grounded). Output set automatically.",
+                Operation::DescribeResource => "Add a describe_resource step (inspect resources). Args: id, intent, args {uris (refs to ResourceCandidates)}, depends_on (the search step). Output set automatically.",
+                Operation::Query => "Add a query step (typed graph pattern). Args: id, intent, args {pattern}, depends_on (the describe step). Output set automatically.",
+                Operation::Create => "Add a create step (executor only). Args: id, intent, args {types, properties?}, depends_on (the describe step). Output set automatically.",
+                Operation::Update => "Add an update step (executor only). Args: id, intent, args {targets (uri_set_ref), predicate, objects}, depends_on (query + describe steps). Output set automatically.",
+                Operation::Delete => "Add a delete step (executor only). Args: id, intent, args {targets (uri_set_ref)}, depends_on (the query step). Output set automatically.",
+                Operation::Validate => "Add a validate step (SHACL check). Args: id, intent, args {}, depends_on (the mutation step). Output set automatically.",
+                Operation::Verify => "Add a verify step (independent re-query proof). Args: id, intent, args {question}, depends_on (validate or mutation step). Output set automatically.",
+            },
+            schema: per_op_tool_schema(*op),
+        })
+        .collect()
+}
+
 /// Planning-tool definitions in the existing [`ToolDef`] (Needle) style.
 pub fn planning_tool_defs() -> Vec<ToolDef> {
-    vec![
+    let mut defs = vec![
         ToolDef {
             name: TOOL_ADD_STEP,
             description: "Add one operation to the in-memory plan. Args: id (e.g. s1), operation, intent, args (typed per operation), depends_on (existing step ids, never inferred), output. read-only intent; never executes RDF ops.",
@@ -273,7 +471,70 @@ pub fn planning_tool_defs() -> Vec<ToolDef> {
                 "additionalProperties": false
             }),
         },
-    ]
+    ];
+    defs.extend(per_op_planning_tool_defs());
+    defs
+}
+
+/// Output types produced by the steps built so far.
+fn produced_outputs(session: &PlanningSession) -> std::collections::HashSet<OutputType> {
+    session.plan.steps.iter().map(|s| s.output).collect()
+}
+
+/// Whether offering the per-operation add tool for `op` is legal given
+/// the outputs produced so far. Mirrors the validator's dependency
+/// type rules (conservative: when in doubt the tool stays offered;
+/// wrongly-offered calls are still rejected at add time).
+fn add_tool_legal(op: Operation, produced: &std::collections::HashSet<OutputType>) -> bool {
+    use OutputType as O;
+    let has = |t: O| produced.contains(&t);
+    match op {
+        Operation::SearchVocabulary | Operation::SearchInstances => true,
+        Operation::DescribeVocabulary => has(O::VocabularyCandidates),
+        Operation::Query | Operation::Create => has(O::ResolvedVocabulary),
+        Operation::DescribeResource => has(O::ResourceCandidates),
+        Operation::Update => {
+            has(O::UriSet) && (has(O::ResolvedVocabulary) || has(O::ResourceCandidates))
+        }
+        Operation::Delete => has(O::UriSet),
+        Operation::Validate => has(O::MutationResult),
+        Operation::Verify => has(O::MutationResult) || has(O::ValidationResult),
+    }
+}
+
+/// Filtered tool *definitions* for one B turn (shared by the filter
+/// pins and the agentstream mapping below).
+pub fn planning_tool_defs_for_session(session: &PlanningSession) -> Vec<ToolDef> {
+    let produced = produced_outputs(session);
+    let has_steps = !session.plan.steps.is_empty();
+    planning_tool_defs()
+        .into_iter()
+        .filter(|d| {
+            if let Some(op) = op_for_add_tool(d.name) {
+                return add_tool_legal(op, &produced);
+            }
+            match d.name {
+                TOOL_REVISE_STEP | TOOL_REMOVE_STEP => has_steps,
+                _ => true,
+            }
+        })
+        .collect()
+}
+
+/// Tool set for one B turn: session tools always (inspect / finish /
+/// clarification), revise + remove only once steps exist, the generic
+/// `add_step` fallback always (usage is counted), and per-operation
+/// add tools only for currently-legal operations.
+pub fn planning_tools_for_session(
+    session: &PlanningSession,
+) -> Vec<agentstream::tools::Tool> {
+    planning_tool_defs_for_session(session)
+        .into_iter()
+        .map(|d| {
+            agentstream::tools::Tool::new(d.name.to_string(), d.description.to_string())
+                .with_parameters(d.schema.clone())
+        })
+        .collect()
 }
 
 /// Planning-tool definitions as `agentstream` tools for Option B
@@ -336,7 +597,14 @@ pub fn planner_system_prompt(graph_ctx: &GraphContext) -> String {
         5. You may call read-only discovery (search_vocabulary, describe_vocabulary, search_instances, describe_resource, inspect_query) while planning. \
         Never call create, update, delete, execute_query, or build_query during planning.\n\
         6. Flag unknown value representations (literal vs IRI, e.g. \"Ohio\" vs \"OH\") instead of assuming one.\n\
-        \nGraph context:\n{}",
+        \nGraph context:\n{}\n\
+        \nPrefer the per-operation add tools: each carries its exact args schema, \
+        so copy the envelope shape exactly. Example — a vocabulary lookup step:\n\
+        add_search_vocabulary_step({{\"id\": \"s1\", \"intent\": \"discover contact vocabulary\", \
+        \"args\": {{\"terms\": [\"contact\"]}}, \"depends_on\": []}}). \
+        Never invent the output field: it is set automatically. \
+        End with finish_plan({{\"rationale\": \"...\"}}) only when every required \
+        operation and dependency is represented.",
         graph_context_summary(graph_ctx)
     )
 }
@@ -366,7 +634,12 @@ pub fn planning_turn_prompt(
 pub fn structured_request_message(request: &UserRequest, ctx: &OperationContext) -> String {
     format!(
         "{}\n\nUser objective:\n{}\n\nGraph context:\n{}\n\nReturn the complete operational plan as a single JSON object matching the provided schema (goal, steps with id/operation/intent/args/depends_on/output, assumptions). \
-        Use step_ref / uri_set_ref for values produced by earlier steps; never invent URIs.",
+        Use step_ref / uri_set_ref for values produced by earlier steps; never invent URIs. \
+        Minimal example (exact args shape — every step's args must match its operation's schema, with kind): \
+        {{\"goal\": \"...\", \"steps\": [{{\"id\": \"s1\", \"operation\": \"search_vocabulary\", \
+        \"intent\": \"discover contact vocabulary\", \
+        \"args\": {{\"kind\": \"search_vocab\", \"terms\": [\"contact\"]}}, \
+        \"depends_on\": [], \"output\": \"VocabularyCandidates\"}}]}}.",
         planner_system_prompt(&ctx.graph_context),
         request.text,
         graph_context_summary(&ctx.graph_context)
@@ -389,7 +662,8 @@ pub fn extraction_request_message(prose: &str) -> String {
     format!(
         "Encode the following natural-language operational plan into the provided plan schema. Encode, do not improve: \
         preserve every numbered step in order as s1..sN, preserve every stated dependency, do not add or drop operations, \
-        and represent unknown values as unresolved or step references.\n\nNatural-language plan:\n{prose}"
+        represent unknown values as unresolved or step references, and give every step's args exactly its operation's \
+        schema shape including kind (e.g. search_vocabulary takes {{\"kind\": \"search_vocab\", \"terms\": [...]}}).\n\nNatural-language plan:\n{prose}"
     )
 }
 
@@ -459,6 +733,9 @@ fn plan_digest(plan: &Plan) -> u64 {
 pub struct PlanningSession {
     pub plan: Plan,
     pub turns: usize,
+    /// Generic-`add_step` calls applied (fallback path; per-operation
+    /// tools do not increment this). The `filter-miss` tuning signal.
+    pub fallback_uses: usize,
     no_progress_streak: usize,
     last_digest: u64,
 }
@@ -475,6 +752,7 @@ impl PlanningSession {
         Self {
             plan,
             turns: 0,
+            fallback_uses: 0,
             no_progress_streak: 0,
             last_digest,
         }
@@ -482,6 +760,21 @@ impl PlanningSession {
 
     fn ids(&self) -> Vec<String> {
         self.plan.steps.iter().map(|s| s.id.clone()).collect()
+    }
+
+    /// Phase-1 counters (item 5): turns, steps, generic-fallback uses.
+    /// Recorded on the context whenever a loop finishes a plan so
+    /// harnesses can report them without parsing transcripts.
+    fn record_stats(&self, ctx: &mut OperationContext) {
+        ctx.artifacts.insert(
+            "planner_stats".to_string(),
+            serde_json::json!({
+                "turns": self.turns,
+                "steps": self.plan.steps.len(),
+                "fallback_uses": self.fallback_uses,
+            })
+            .to_string(),
+        );
     }
 
     fn note_progress(&mut self, caps: &PlanCaps) -> Result<(), PlannerError> {
@@ -560,18 +853,99 @@ fn check_step_consistency(
     Ok(())
 }
 
+/// Insert/overwrite the `kind` discriminator in a step-args object from
+/// the operation. Authoritative: the tool name (per-op path) or the
+/// `operation` field (generic path) decides the kind, never the model.
+fn set_args_kind(step_args: &mut serde_json::Value, op: Operation) {
+    if let Some(map) = step_args.as_object_mut() {
+        map.insert(
+            "kind".to_string(),
+            serde_json::Value::String(kind_str_for(op).to_string()),
+        );
+    }
+}
+
+/// Generic `add_step`: kind-default normalization (Phase 1, item 3) —
+/// a missing `kind` is derived from `operation` instead of rejected.
+/// Missing *data* fields still reject exactly as before. Counts as a
+/// fallback use.
 fn apply_add_step(
     session: &mut PlanningSession,
     caps: &PlanCaps,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, PlannerError> {
-    let a: AddStepArgs = serde_json::from_value(args)
+    let mut v = args;
+    let op: Option<Operation> = v
+        .get("operation")
+        .and_then(|o| o.as_str())
+        .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok());
+    if let (Some(op), Some(map)) = (op, v.get_mut("args").and_then(|a| a.as_object_mut())) {
+        map.entry("kind".to_string())
+            .or_insert_with(|| serde_json::Value::String(kind_str_for(op).to_string()));
+    }
+    // Counted on attempt (not just success): every generic call is a
+    // filter-miss signal, including the ones that still fail.
+    session.fallback_uses += 1;
+    let a: AddStepArgs = serde_json::from_value(v)
         .map_err(|e| PlannerError::Schema(format!("invalid add_step args: {e}")))?;
-    if session.plan.steps.iter().any(|s| s.id == a.id) {
+    push_step(session, caps, &a.id, a.operation, a.intent, a.args, a.depends_on, a.output)
+}
+
+/// Per-operation add tool: `kind` always comes from the tool name,
+/// `output` always comes from `expected_for(op)` — neither is
+/// model-emitted, so neither can be wrong.
+fn apply_add_step_for(
+    op: Operation,
+    session: &mut PlanningSession,
+    caps: &PlanCaps,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, PlannerError> {
+    #[derive(Debug, serde::Deserialize)]
+    struct PerOpAddArgs {
+        id: String,
+        intent: String,
+        args: serde_json::Value,
+        #[serde(default)]
+        depends_on: Vec<String>,
+    }
+    let a: PerOpAddArgs = serde_json::from_value(args)
+        .map_err(|e| PlannerError::Schema(format!("invalid {} args: {e}", per_op_add_tool(op))))?;
+    let mut step_args = a.args;
+    set_args_kind(&mut step_args, op);
+    let step_args: StepArguments = serde_json::from_value(step_args)
+        .map_err(|e| PlannerError::Schema(format!("invalid {} step args: {e}", per_op_add_tool(op))))?;
+    push_step(
+        session,
+        caps,
+        &a.id,
+        op,
+        a.intent,
+        step_args,
+        a.depends_on,
+        OutputType::expected_for(op),
+    )
+}
+
+/// Shared step-insertion core: duplicate / cap / consistency checks,
+/// then push. Verbose failures name the step so the next-turn
+/// feedback can quote them.
+#[allow(clippy::too_many_arguments)]
+fn push_step(
+    session: &mut PlanningSession,
+    caps: &PlanCaps,
+    id: &str,
+    operation: Operation,
+    intent: String,
+    args: StepArguments,
+    depends_on: Vec<String>,
+    output: OutputType,
+) -> Result<serde_json::Value, PlannerError> {
+    let a_id = id.to_string();
+    if session.plan.steps.iter().any(|s| s.id == a_id) {
         return Err(validation_err(
-            Some(&a.id),
+            Some(id),
             "duplicate",
-            format!("step id {:?} already exists", a.id),
+            format!("step id {id:?} already exists"),
         ));
     }
     if session.plan.steps.len() >= caps.max_plan_steps {
@@ -586,25 +960,25 @@ fn apply_add_step(
         .plan
         .steps
         .iter()
-        .any(|s| s.operation == a.operation && s.args == a.args)
+        .any(|s| s.operation == operation && s.args == args)
     {
         return Err(validation_err(
-            Some(&a.id),
+            Some(id),
             "duplicate",
             "an identical operation step already exists; revise it instead of duplicating",
         ));
     }
     let existing = session.ids();
-    check_step_consistency(&a.id, a.operation, &a.args, a.output, &a.depends_on, &existing)?;
+    check_step_consistency(id, operation, &args, output, &depends_on, &existing)?;
     session.plan.steps.push(PlanStep {
-        id: a.id.clone(),
-        operation: a.operation,
-        intent: a.intent,
-        args: a.args,
-        depends_on: a.depends_on,
-        output: a.output,
+        id: a_id,
+        operation,
+        intent,
+        args,
+        depends_on,
+        output,
     });
-    Ok(serde_json::json!({"added": a.id}))
+    Ok(serde_json::json!({"added": id}))
 }
 
 fn apply_revise_step(
@@ -784,6 +1158,10 @@ fn apply_call(
 ) -> Result<CallOutcome, PlannerError> {
     match name {
         TOOL_ADD_STEP => Ok(CallOutcome::Value(apply_add_step(session, caps, args)?)),
+        name if op_for_add_tool(name).is_some() => {
+            let op = op_for_add_tool(name).expect("guarded by op_for_add_tool");
+            Ok(CallOutcome::Value(apply_add_step_for(op, session, caps, args)?))
+        }
         TOOL_REVISE_STEP => Ok(CallOutcome::Value(apply_revise_step(session, ctx, args)?)),
         TOOL_REMOVE_STEP => Ok(CallOutcome::Value(apply_remove_step(session, args)?)),
         TOOL_INSPECT_PLAN => Ok(CallOutcome::Value(inspect_plan_value(session))),
@@ -952,7 +1330,10 @@ impl NeedleSequentialPlanner {
                         ));
                     }
                     match attempt_implicit_finish(&mut session) {
-                        Ok(Some(plan)) => return Ok(plan),
+                        Ok(Some(plan)) => {
+                        session.record_stats(ctx);
+                        return Ok(plan);
+                    }
                         Ok(None) => unreachable!(),
                         Err(e) => {
                             session.note_progress(&self.caps)?;
@@ -967,7 +1348,10 @@ impl NeedleSequentialPlanner {
             };
             if calls.is_empty() {
                 match attempt_implicit_finish(&mut session) {
-                    Ok(Some(plan)) => return Ok(plan),
+                    Ok(Some(plan)) => {
+                        session.record_stats(ctx);
+                        return Ok(plan);
+                    }
                     Ok(None) => unreachable!(),
                     Err(e) => {
                         session.note_progress(&self.caps)?;
@@ -985,6 +1369,7 @@ impl NeedleSequentialPlanner {
             match apply_turn(&mut session, &self.services, ctx, &self.caps, &snapshot) {
                 Ok(app) => {
                     if let Some(plan) = app.finished {
+                        session.record_stats(ctx);
                         return Ok(plan);
                     }
                     let _ = self
@@ -1059,6 +1444,12 @@ impl AgentBackend {
     /// request carries the compact [`OperationContext`] rendering rather
     /// than an ever-growing transcript (`clear_history` keeps the system
     /// message, which is re-sent separately by `agentstream`).
+    ///
+    /// NOTE: agentstream's own JSONL event log (`embedded-log` feature)
+    /// does not compile against the `openai-backend`+`tool-registry` set
+    /// (upstream `ext.rs` type errors), so this build records nothing
+    /// inside agentstream; per-turn output is tee'd to the caller's
+    /// stream log instead (see `ladder_cli`'s `TeeBackend`).
     pub fn stream(&self) -> agentstream::agent::AgentStream {
         crate::llm::build_agent(self.backend.clone(), &self.model, self.max_tokens)
     }
@@ -1099,7 +1490,6 @@ impl Planner for AgentToolPlanner {
     ) -> Result<Plan, PlannerError> {
         let mut session = PlanningSession::new(request, ctx);
         let system = planner_system_prompt(&ctx.graph_context);
-        let tools = planning_tools_for_agent();
         let mut agent = self.backend.stream();
         agent.set_system(&system);
         let mut message = planning_turn_prompt(request, ctx, &session.plan, &[]);
@@ -1112,10 +1502,13 @@ impl Planner for AgentToolPlanner {
                 )));
             }
             // Compact-context discipline: rebuild from current state.
+            // Per-turn tool filter: only currently-legal operations are
+            // offered (Phase 1, item 2); the generic fallback stays.
             agent.clear_history();
+            let tools = planning_tools_for_session(&session);
             let resp = agent
                 .send(&message)
-                .with_tools(tools.clone())
+                .with_tools(tools)
                 .await
                 .map_err(|e| PlannerError::Model(e))?;
             let calls: Vec<(String, serde_json::Value)> = resp
@@ -1125,7 +1518,10 @@ impl Planner for AgentToolPlanner {
                 .collect();
             if calls.is_empty() {
                 match attempt_implicit_finish(&mut session) {
-                    Ok(Some(plan)) => return Ok(plan),
+                    Ok(Some(plan)) => {
+                        session.record_stats(ctx);
+                        return Ok(plan);
+                    }
                     Ok(None) => unreachable!(),
                     Err(e) => {
                         session.note_progress(&self.caps)?;
@@ -1141,6 +1537,7 @@ impl Planner for AgentToolPlanner {
             match apply_turn(&mut session, &self.services, ctx, &self.caps, &calls) {
                 Ok(app) => {
                     if let Some(plan) = app.finished {
+                        session.record_stats(ctx);
                         return Ok(plan);
                     }
                     session.note_progress(&self.caps)?;
@@ -1167,10 +1564,31 @@ fn truncate_text(s: &str, max: usize) -> String {
 // Structured output (shared by C + second pass of D)
 // ---------------------------------------------------------------------------
 
+/// All ten operations, for the structured anyOf.
+const ALL_OPERATIONS: &[Operation] = &[
+    Operation::SearchVocabulary,
+    Operation::DescribeVocabulary,
+    Operation::SearchInstances,
+    Operation::DescribeResource,
+    Operation::Query,
+    Operation::Create,
+    Operation::Update,
+    Operation::Delete,
+    Operation::Validate,
+    Operation::Verify,
+];
+
 /// JSON Schema sent with `with_schema(..., Some("operational_plan"))`.
-/// Structural detail is best-effort for the provider; strictness lives in
-/// Rust (`serde` parse + [`crate::plan::validate_plan`]).
+/// Phase 1, item 2: step `args` is an exact anyOf over the ten
+/// `StepArguments` variants (same generator as the per-op tool
+/// schemas) instead of the old unconstrained `{"type": "object"}`.
+/// Structural detail is still best-effort for the provider; strictness
+/// lives in Rust (`serde` parse + [`crate::plan::validate_plan`]).
 pub fn plan_schema_json() -> serde_json::Value {
+    let args_any_of: Vec<serde_json::Value> = ALL_OPERATIONS
+        .iter()
+        .map(|op| args_schema_for(*op, true))
+        .collect();
     serde_json::json!({
         "type": "object",
         "required": ["goal", "steps"],
@@ -1187,7 +1605,7 @@ pub fn plan_schema_json() -> serde_json::Value {
                         "id": {"type": "string"},
                         "operation": {"type": "string", "enum": OPERATION_VALUES},
                         "intent": {"type": "string"},
-                        "args": {"type": "object"},
+                        "args": {"anyOf": args_any_of},
                         "depends_on": {"type": "array", "items": {"type": "string"}},
                         "output": {"type": "string", "enum": OUTPUT_VALUES}
                     },
@@ -1199,7 +1617,7 @@ pub fn plan_schema_json() -> serde_json::Value {
     })
 }
 
-fn strip_code_fences(text: &str) -> &str {
+pub(crate) fn strip_code_fences(text: &str) -> &str {
     let t = text.trim();
     let t = t.strip_prefix("```json").or_else(|| t.strip_prefix("```")).unwrap_or(t);
     let t = t.strip_suffix("```").unwrap_or(t);
@@ -1223,6 +1641,29 @@ pub fn parse_plan_json(
         }
         _ => value,
     };
+    let mut inner = inner;
+    // Kind-default normalization (Phase 1, item 3) for the structured
+    // path: a missing args `kind` is derived from the step's
+    // `operation`, exactly like the generic `add_step` path.
+    if let Some(steps) = inner
+        .get_mut("steps")
+        .and_then(|s| s.as_array_mut())
+    {
+        for step in steps.iter_mut() {
+            let op: Option<Operation> = step
+                .get("operation")
+                .and_then(|o| o.as_str())
+                .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok());
+            if let (Some(op), Some(map)) = (
+                op,
+                step.get_mut("args").and_then(|a| a.as_object_mut()),
+            ) {
+                map.entry("kind".to_string()).or_insert_with(|| {
+                    serde_json::Value::String(kind_str_for(op).to_string())
+                });
+            }
+        }
+    }
     let mut plan: Plan = serde_json::from_value(inner)
         .map_err(|e| PlannerError::Schema(format!("response does not match the plan schema: {e}")))?;
     // Rust owns the context; the goal must not be blank.
@@ -2251,6 +2692,103 @@ mod tests {
         assert!(outs.contains(&serde_json::json!("UriSet")));
     }
 
+    // -- Phase 2: spine-first ----------------------------------------------
+
+    fn spine_script_backend(
+        responses: Vec<agentstream::backends::BackendResponse>,
+    ) -> (Arc<ScriptBackend>, AgentBackend) {
+        let script = Arc::new(ScriptBackend {
+            responses: Mutex::new(responses.into()),
+            seen_models: Mutex::new(vec![]),
+            seen_tool_schemas: Mutex::new(vec![]),
+        });
+        let backend: Arc<dyn LLMBackend> = script.clone();
+        (script, AgentBackend::new(backend, "test-local-model"))
+    }
+
+    fn text_resp(text: &str) -> agentstream::backends::BackendResponse {
+        agentstream::backends::BackendResponse {
+            text: text.to_string(),
+            finish_reason: Some("stop".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn tool_resp(calls: Vec<(String, serde_json::Value)>) -> agentstream::backends::BackendResponse {
+        agentstream::backends::BackendResponse {
+            text: String::new(),
+            tool_calls: calls
+                .into_iter()
+                .enumerate()
+                .map(|(i, (name, input))| agentstream::backends::ToolCallData {
+                    name,
+                    input,
+                    id: Some(format!("call-{i}")),
+                })
+                .collect(),
+            finish_reason: Some("tool_calls".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn spine_elicitation_assembles_l1() {
+        use crate::planner::spine::SpinePlanner;
+        let (services, graph_ctx) = fixture_services();
+        let (_script, backend) =
+            spine_script_backend(vec![text_resp(r#"{"terms": ["contact"]}"#)]);
+        let planner = SpinePlanner::new(backend, services);
+        let request = UserRequest::new("List the vocabulary terms for contacts.");
+        let mut ctx = op_ctx(graph_ctx);
+        let plan = planner.create_plan(&request, &mut ctx).await.unwrap();
+        crate::plan::validate_plan(&plan).unwrap();
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(ctx.artifacts.get("routing").map(String::as_str), Some("spine:lookup"));
+    }
+
+    #[tokio::test]
+    async fn spine_falls_back_on_unmatched_request() {
+        use crate::planner::spine::SpinePlanner;
+        let (services, graph_ctx) = fixture_services();
+        let add = add_step_call(
+            "s1", "search_vocabulary", "discover",
+            search_vocab_args(vec!["contact"]), vec![], "VocabularyCandidates",
+        );
+        let finish = (TOOL_FINISH_PLAN.to_string(), serde_json::json!({"rationale": "x"}));
+        let (_script, backend) =
+            spine_script_backend(vec![tool_resp(vec![add]), tool_resp(vec![finish])]);
+        let planner = SpinePlanner::new(backend, services);
+        let request = UserRequest::new("do something unclassifiable xyzzy");
+        let mut ctx = op_ctx(graph_ctx);
+        let plan = planner.create_plan(&request, &mut ctx).await.unwrap();
+        crate::plan::validate_plan(&plan).unwrap();
+        assert_eq!(ctx.artifacts.get("routing").map(String::as_str), Some("unmatched-request"));
+    }
+
+    #[tokio::test]
+    async fn spine_falls_back_on_garbage_elicitation() {
+        use crate::planner::spine::SpinePlanner;
+        let (services, graph_ctx) = fixture_services();
+        let add = add_step_call(
+            "s1", "search_vocabulary", "discover",
+            search_vocab_args(vec!["contact"]), vec![], "VocabularyCandidates",
+        );
+        let finish = (TOOL_FINISH_PLAN.to_string(), serde_json::json!({"rationale": "x"}));
+        let (_script, backend) = spine_script_backend(vec![
+            text_resp("not json"),
+            text_resp("still not json"),
+            tool_resp(vec![add]),
+            tool_resp(vec![finish]),
+        ]);
+        let planner = SpinePlanner::new(backend, services);
+        let request = UserRequest::new("List the vocabulary terms for contacts.");
+        let mut ctx = op_ctx(graph_ctx);
+        let plan = planner.create_plan(&request, &mut ctx).await.unwrap();
+        crate::plan::validate_plan(&plan).unwrap();
+        let routing = ctx.artifacts.get("routing").cloned().unwrap_or_default();
+        assert!(routing.starts_with("spine-failed"), "got: {routing}");
+    }
+
     #[test]
     fn prompt_builders_stay_compact() {
         let graph_ctx = GraphContext {
@@ -2268,5 +2806,187 @@ mod tests {
         assert!(turn.contains("goal"));
         assert!(!turn.contains("quad"));
         let _ = VecDeque::<u8>::new();
+    }
+
+    // -- Phase 1: per-operation tools ------------------------------------
+
+    fn per_op_call(tool: &str, id: &str, intent: &str, args: serde_json::Value, deps: Vec<&str>) -> (String, serde_json::Value) {
+        (
+            tool.to_string(),
+            serde_json::json!({"id": id, "intent": intent, "args": args, "depends_on": deps}),
+        )
+    }
+
+    fn empty_session() -> (PlanningSession, OperationContext, PlanningServices) {
+        let (services, graph_ctx) = fixture_services();
+        let ctx = op_ctx(graph_ctx);
+        let request = UserRequest::new("ladder");
+        let session = PlanningSession::new(&request, &ctx);
+        (session, ctx, services)
+    }
+
+    #[test]
+    fn per_op_tool_emits_valid_step_without_kind_or_output() {
+        let (mut session, ctx, services) = empty_session();
+        let caps = PlanCaps::default();
+        // No `kind`, no `output`: both come from Rust, neither can be wrong.
+        let call = per_op_call(
+            TOOL_ADD_SEARCH_VOCABULARY,
+            "s1",
+            "discover contact vocabulary",
+            serde_json::json!({"terms": ["contact"]}),
+            vec![],
+        );
+        let out = apply_call(&mut session, &services, &ctx, &caps, &call.0, call.1).unwrap();
+        assert!(matches!(out, CallOutcome::Value(_)));
+        assert_eq!(session.fallback_uses, 0, "per-op path is not the fallback");
+        let step = &session.plan.steps[0];
+        assert_eq!(step.operation, Operation::SearchVocabulary);
+        assert_eq!(step.output, OutputType::VocabularyCandidates);
+        assert!(matches!(&step.args, StepArguments::SearchVocab { terms, .. } if terms == &["contact".to_string()]));
+    }
+
+    #[test]
+    fn per_op_tool_rejects_wrong_shape() {
+        let (mut session, ctx, services) = empty_session();
+        let caps = PlanCaps::default();
+        // `question` belongs to verify, not search_vocabulary.
+        let call = per_op_call(
+            TOOL_ADD_SEARCH_VOCABULARY,
+            "s1",
+            "x",
+            serde_json::json!({"question": "who?"}),
+            vec![],
+        );
+        let err = apply_call(&mut session, &services, &ctx, &caps, &call.0, call.1).unwrap_err();
+        assert!(matches!(err, PlannerError::Schema(_)));
+        assert!(session.plan.steps.is_empty());
+    }
+
+    #[test]
+    fn generic_add_step_defaults_kind_and_counts_fallback() {
+        let (mut session, ctx, services) = empty_session();
+        let caps = PlanCaps::default();
+        // Kindless args (the live L1 failure shape) now normalize.
+        let (name, args) = add_step_call(
+            "s1",
+            "search_vocabulary",
+            "discover",
+            serde_json::json!({}),
+            vec![],
+            "VocabularyCandidates",
+        );
+        let err = apply_call(&mut session, &services, &ctx, &caps, &name, args).unwrap_err();
+        // kind defaulted (no longer "missing kind") but terms are still
+        // required data — the error must be about terms, not kind.
+        let msg = format!("{err:?}");
+        assert!(!msg.contains("kind"), "kind must default, got: {msg}");
+        assert_eq!(session.fallback_uses, 1);
+    }
+
+    #[test]
+    fn filter_offers_only_legal_tools() {
+        fn names(session: &PlanningSession) -> Vec<String> {
+            let mut v: Vec<String> = planning_tools_for_session(session)
+                .iter()
+                .map(|t| t.name.clone())
+                .collect();
+            v.sort();
+            v
+        }
+        let (session, _ctx, _services) = empty_session();
+        // Discovery-empty: 2 searches + generic fallback + 3 session tools.
+        assert_eq!(
+            names(&session),
+            vec![
+                "add_search_instances_step",
+                "add_search_vocabulary_step",
+                "add_step",
+                "finish_plan",
+                "inspect_plan",
+                "request_clarification",
+            ]
+        );
+        // After VocabularyCandidates: describe unlocks, revise/remove appear.
+        let (mut session2, ctx2, services2) = empty_session();
+        let caps = PlanCaps::default();
+        let call = per_op_call(
+            TOOL_ADD_SEARCH_VOCABULARY, "s1", "d",
+            serde_json::json!({"terms": ["contact"]}), vec![],
+        );
+        apply_call(&mut session2, &services2, &ctx2, &caps, &call.0, call.1).unwrap();
+        assert_eq!(
+            names(&session2),
+            vec![
+                "add_describe_vocabulary_step",
+                "add_search_instances_step",
+                "add_search_vocabulary_step",
+                "add_step",
+                "finish_plan",
+                "inspect_plan",
+                "remove_step",
+                "request_clarification",
+                "revise_step",
+            ]
+        );
+    }
+
+    #[test]
+    fn structured_schema_carries_exact_args_anyof() {
+        let schema = plan_schema_json();
+        let any_of = schema["properties"]["steps"]["items"]["properties"]["args"]["anyOf"]
+            .as_array()
+            .expect("args is an exact anyOf");
+        assert_eq!(any_of.len(), 10, "one variant per operation");
+        let search = &any_of[0];
+        assert_eq!(search["properties"]["kind"]["const"], "search_vocab");
+        assert!(search["required"].as_array().unwrap().contains(&serde_json::json!("kind")));
+        assert!(search["required"].as_array().unwrap().contains(&serde_json::json!("terms")));
+    }
+
+    #[test]
+    fn per_op_schemas_agree_with_validator_shapes() {
+        // Every per-op schema accepts its canonical args and the parsed
+        // shape validates as a plan step (agreement, Rust-side).
+        for op in ALL_OPERATIONS {
+            let schema = args_schema_for(*op, true);
+            assert_eq!(schema["type"], "object");
+            let required = schema["required"].as_array().unwrap();
+            assert!(required.contains(&serde_json::json!("kind")), "{op:?}: kind required on wire");
+            let kind_const = schema["properties"]["kind"]["const"].as_str().unwrap();
+            assert_eq!(kind_const, kind_str_for(*op));
+        }
+        // Tool path omits kind (Rust fills it) but keeps the shape.
+        let loose = args_schema_for(Operation::SearchVocabulary, false);
+        assert!(!loose["required"].as_array().unwrap().contains(&serde_json::json!("kind")));
+    }
+
+    #[test]
+    fn prompt_and_tools_stay_within_token_budgets() {
+        // Phase-1 token math (item 2): the filtered prompt must stay
+        // smaller than the old unfiltered surface.
+        let graph_ctx = GraphContext {
+            dataset: "crm".to_string(),
+            graphs: vec![crate::rdf::GraphName::tenant("acme").unwrap()],
+            ..Default::default()
+        };
+        let request = UserRequest::new("List the vocabulary terms for contacts.");
+        let ctx = op_ctx(graph_ctx);
+        let session = PlanningSession::new(&request, &ctx);
+        let system = planner_system_prompt(&ctx.graph_context);
+        let turn = planning_turn_prompt(&request, &ctx, &session.plan, &[]);
+        let schema_bytes = |defs: Vec<ToolDef>| -> usize {
+            defs.iter().map(|d| d.schema.to_string().len()).sum()
+        };
+        let filtered = planning_tool_defs_for_session(&session);
+        let unfiltered = planning_tool_defs();
+        let filtered_len: usize = schema_bytes(filtered);
+        let unfiltered_len: usize = schema_bytes(unfiltered);
+        assert!(
+            filtered_len < unfiltered_len,
+            "filtered ({filtered_len}) must beat unfiltered ({unfiltered_len})"
+        );
+        let total = system.len() + turn.len() + filtered_len;
+        assert!(total < 20_000, "L1 prompt+tools budget: {total} chars");
     }
 }

@@ -226,3 +226,28 @@ defined (ignored locally, required in nightly).
   no weights (replay/stub/scripted). Live runs are opt-in (`RUN_MODEL_TESTS=1`,
   `--features live-model` for A/Needle) and write the recordings CI replays.
 - Floors only ratchet upward; T5 locks them.
+
+## Addendum — fixes/plan Phase 3: compiler default (2026-11-27)
+
+The planning default after fixes/plan Phase 3 is the deterministic
+request compiler (`src/planner/compiler.rs`), not a planner loop:
+classify → link → fill slots → ground → assemble → validate, with zero
+model calls on the happy path. The model answers only bounded
+per-field slot questions; the B tool loop survives solely as the loud,
+counted escalation for `Unmatched` requests.
+
+New gate metrics (tracked alongside the T5 operational set):
+`unmatched-request` rate over the fixed-100 corpus (published per row
+with its fate: `compiler-default` / `rule-candidate:<rule>` /
+`accepted-llm`), per-call `model_slot_calls` (0 on the happy path),
+and steps-per-rung (compiler emits the same spine shapes, so the
+before/after is loop turns eliminated, not steps changed). Corpus
+floor: 15/100 owned (the phase-2 spine floor, exactly); growth comes
+only from `rule-candidate` rows with live evidence.
+
+Nightly additions (ignored locally, required in nightly):
+`RUN_MODEL_TESTS=1 cargo test --test phase3_compiler
+live_compiler_ohio_e2e -- --ignored --test-threads=1` (deterministic
+create leg + live disambiguation leg). Variant futures are decided:
+escalation fallback = B loop only; A/C/D retired from planning duty
+(code and tests stay), recorded in `OPERATIONS.md`.
