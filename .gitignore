@@ -1,2 +1,4 @@
 .env
 target/
+tests/bench_cases/*
+tests/recordings/*
